@@ -5,13 +5,16 @@ from openwakeword.model import Model
 from faster_whisper import WhisperModel
 
 # --- Configuration ---
-RATE = 16000          # Standard sample rate for these models
-CHUNK = 1280          # Audio chunk size (1280 samples = 80ms)
+RATE = 16000
+CHUNK = 1280
 WAKE_WORD = "hey_jarvis"
-LISTEN_TIME = 5       # Seconds to record after wake word
+
+# Silence Detection Settings
+THRESHOLD = 500       # Volume threshold (0-32768). Adjust if mic is sensitive.
+SILENCE_LIMIT = 2     # Seconds of silence before stopping
+MAX_TIME = 10         # Safety limit: stop recording after 10s no matter what
 
 def main():
-    # 1. Setup Resources
     print("Loading models...")
     openwakeword.utils.download_models()
     ww_model = Model(wakeword_models=[WAKE_WORD])
@@ -28,34 +31,43 @@ def main():
             data = stream.read(CHUNK, exception_on_overflow=False)
             audio_int16 = np.frombuffer(data, dtype=np.int16)
 
-            # Get prediction (returns a dict like {'hey_jarvis': 0.002})
-            prediction = ww_model.predict(audio_int16)
+            if ww_model.predict(audio_int16)[WAKE_WORD] > 0.5:
+                print(f"\n[!] Wake word detected! Listening...")
 
-            # Check if confidence is above 50%
-            if prediction[WAKE_WORD] > 0.5:
-                print(f"\n[!] Wake word detected! Recording for {LISTEN_TIME}s...")
-
-                # --- Active Phase: Record Command ---
+                # --- Active Phase: Record until Silence ---
                 frames = []
-                # Calculate how many chunks we need to read to match LISTEN_TIME
-                chunks_to_record = int(RATE / CHUNK * LISTEN_TIME)
-                
-                for _ in range(chunks_to_record):
-                    data = stream.read(CHUNK)
-                    frames.append(np.frombuffer(data, dtype=np.int16))
+                silence_chunks = 0
+                max_chunks = int(RATE / CHUNK * MAX_TIME)
+                chunks_for_silence = int(RATE / CHUNK * SILENCE_LIMIT)
 
-                # --- Processing Phase: Transcribe ---
+                for _ in range(max_chunks):
+                    data = stream.read(CHUNK)
+                    chunk = np.frombuffer(data, dtype=np.int16)
+                    frames.append(chunk)
+
+                    # Calculate "Loudness" (Mean Absolute Amplitude)
+                    loudness = np.abs(chunk).mean()
+
+                    # Check if silence
+                    if loudness < THRESHOLD:
+                        silence_chunks += 1
+                    else:
+                        silence_chunks = 0 # Reset if we hear noise
+
+                    # Stop if we have enough silence chunks in a row
+                    if silence_chunks > chunks_for_silence:
+                        print("[-] Silence detected. Stopping.")
+                        break
+
+                # --- Processing Phase ---
                 print("Transcribing...")
-                
-                # Combine frames and normalize audio to float32 (required by Whisper)
                 audio_float = np.concatenate(frames).flatten().astype(np.float32) / 32768.0
                 
                 segments, _ = whisper.transcribe(audio_float, beam_size=5)
                 text = " ".join([s.text for s in segments]).strip()
                 
-                print(f"[>] User said: '{text}'\n")
+                print(f"[>] You said: '{text}'\n")
 
-                # Reset wake word buffer so it doesn't trigger on its own echo
                 ww_model.reset()
                 print("Waiting...")
 
