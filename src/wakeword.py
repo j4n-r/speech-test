@@ -5,99 +5,65 @@ from openwakeword.model import Model
 from faster_whisper import WhisperModel
 
 # --- Configuration ---
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 16000
-CHUNK = 1280
-WAKE_WORD_THRESHOLD = 0.5
-COMMAND_DURATION = 5  # Seconds to record after wake word
-
-def load_models() -> tuple[Model, WhisperModel]:
-    """Downloads and loads the Wake Word and Whisper models."""
-    print("[*] Loading models...")
-    openwakeword.utils.download_models()
-    
-    # Load Wake Word Model
-    ww_model = Model(wakeword_models=["alexa", "hey_jarvis"])
-    
-    # Load Whisper Model
-    whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-    
-    return ww_model, whisper_model
-
-def get_audio_stream(p: pyaudio.PyAudio) -> pyaudio.Stream:
-    """Configures and opens the microphone stream."""
-    return p.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        frames_per_buffer=CHUNK
-    )
-
-def capture_and_transcribe(stream: pyaudio.Stream, whisper: WhisperModel) -> str:
-    """Records audio for a set duration and returns the transcribed text."""
-    print("[*] Listening for command... ['alexa' or 'hey jarvis']")
-    frames: list[np.ndarray] = []
-
-    # Record audio
-    for _ in range(0, int(RATE / CHUNK * COMMAND_DURATION)):
-        data = stream.read(CHUNK)
-        frames.append(np.frombuffer(data, dtype=np.int16))
-
-    print("[*] Processing...")
-    
-    # Convert buffer to float32 for Whisper (normalization)
-    audio_data = np.concatenate(frames).flatten().astype(np.float32) / 32768.0
-
-    # Transcribe
-    segments, _ = whisper.transcribe(audio_data, beam_size=5)
-    text = "".join([s.text for s in segments]).strip()
-
-    return text
+RATE = 16000          # Standard sample rate for these models
+CHUNK = 1280          # Audio chunk size (1280 samples = 80ms)
+WAKE_WORD = "hey_jarvis"
+LISTEN_TIME = 5       # Seconds to record after wake word
 
 def main():
     # 1. Setup Resources
-    ww_model, whisper_model = load_models()
-    audio = pyaudio.PyAudio()
-    stream = get_audio_stream(audio)
+    print("Loading models...")
+    openwakeword.utils.download_models()
+    ww_model = Model(wakeword_models=[WAKE_WORD])
+    whisper = WhisperModel("small", device="cpu", compute_type="int8")
 
-    print("[*] System Ready. Waiting for wake word...")
+    mic = pyaudio.PyAudio()
+    stream = mic.open(format=pyaudio.paInt16, channels=1, rate=RATE, input=True, frames_per_buffer=CHUNK)
+
+    print(f"System Ready. Waiting for '{WAKE_WORD}'...")
 
     try:
         while True:
-            # Get audio chunk
+            # --- Passive Phase: Listen for Wake Word ---
             data = stream.read(CHUNK, exception_on_overflow=False)
-            audio_frame = np.frombuffer(data, dtype=np.int16)
+            audio_int16 = np.frombuffer(data, dtype=np.int16)
 
-            # Predict Wake Word
-            prediction = ww_model.predict(audio_frame)
+            # Get prediction (returns a dict like {'hey_jarvis': 0.002})
+            prediction = ww_model.predict(audio_int16)
 
-            # Check for triggers
-            for mdl_name, score in prediction.items():
-                if score > WAKE_WORD_THRESHOLD:
-                    print(f"\n[!] Wake Word Detected: {mdl_name}")
-                    
-                    # Capture Command
-                    command_text = capture_and_transcribe(stream, whisper_model)
-                    
-                    if command_text:
-                        print(f"[>] User said: '{command_text}'\n")
-                    else:
-                        print("[>] No speech detected.\n")
+            # Check if confidence is above 50%
+            if prediction[WAKE_WORD] > 0.5:
+                print(f"\n[!] Wake word detected! Recording for {LISTEN_TIME}s...")
 
-                    # Reset model buffer to prevent immediate re-trigger
-                    ww_model.reset()
-                    print("[*] Waiting for wake word...")
+                # --- Active Phase: Record Command ---
+                frames = []
+                # Calculate how many chunks we need to read to match LISTEN_TIME
+                chunks_to_record = int(RATE / CHUNK * LISTEN_TIME)
+                
+                for _ in range(chunks_to_record):
+                    data = stream.read(CHUNK)
+                    frames.append(np.frombuffer(data, dtype=np.int16))
+
+                # --- Processing Phase: Transcribe ---
+                print("Transcribing...")
+                
+                # Combine frames and normalize audio to float32 (required by Whisper)
+                audio_float = np.concatenate(frames).flatten().astype(np.float32) / 32768.0
+                
+                segments, _ = whisper.transcribe(audio_float, beam_size=5)
+                text = " ".join([s.text for s in segments]).strip()
+                
+                print(f"[>] User said: '{text}'\n")
+
+                # Reset wake word buffer so it doesn't trigger on its own echo
+                ww_model.reset()
+                print("Waiting...")
 
     except KeyboardInterrupt:
-        print("\n[*] Stopping...")
-
+        print("\nStopping...")
     finally:
-        # Cleanup
-        stream.stop_stream()
         stream.close()
-        audio.terminate()
+        mic.terminate()
 
 if __name__ == "__main__":
     main()
